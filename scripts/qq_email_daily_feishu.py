@@ -217,20 +217,15 @@ def create_calendar_events(events: list, work_dir: str) -> tuple:
         desc_parts.append(f"Priority: {evt['priority']}")
         description = ", ".join(desc_parts)
 
-        # 转义 shell 特殊字符
-        # 标题只保留 ASCII 可打印字符（避免 cmd.exe 编码问题）
-        summary = evt["title"]
-        if not summary.isascii():
-            # 中文标题：截取前 50 字符并去掉特殊字符
-            summary = re.sub(r'[^\w\s\-:,.()]', '', summary, flags=re.UNICODE)[:50]
-            if not summary.strip():
-                summary = f"Event {evt['date']}"
+        # 转义特殊字符（保留中文标题，chcp 65001 已解决编码问题）
+        summary = evt["title"][:80]  # 截断过长标题
         summary = summary.replace('"', "'")
-        description = description.replace('"', '\\"').replace("'", "\\'")
+        description = description.replace('"', "'")
 
         # 用临时 .bat 文件执行（避免 shell 转义问题）
         lines = [
             '@echo off',
+            'chcp 65001 >nul',  # 切换到 UTF-8 编码，解决中文乱码
             f'cd /d {win_dir}',
             f'npx lark-cli calendar +create --summary "{_bat_escape(summary)}" --start "{start_iso}" --end "{end_iso}" --description "{_bat_escape(description)}" --as user',
         ]
