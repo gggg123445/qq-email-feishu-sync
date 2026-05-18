@@ -123,10 +123,14 @@ def format_markdown(total_emails: int, events: list) -> str:
     upcoming = [e for e in events if e["date"] >= today]
     past = [e for e in events if e["date"] < today]
 
-    if upcoming:
-        lines.append("## 待办日程")
+    # 分离通知和预约
+    upcoming_appt = [e for e in upcoming if e.get("event_type") == "appointment"]
+    upcoming_notif = [e for e in upcoming if e.get("event_type") == "notification"]
+
+    if upcoming_appt:
+        lines.append("## 预约日程（面试/笔试/测评）")
         lines.append("")
-        for i, evt in enumerate(upcoming, 1):
+        for i, evt in enumerate(upcoming_appt, 1):
             priority_icon = {"high": "!!", "medium": "!", "normal": ""}.get(evt["priority"], "")
             prefix = f"[{priority_icon}] " if priority_icon else ""
 
@@ -142,9 +146,19 @@ def format_markdown(total_emails: int, events: list) -> str:
                 lines.append(f"- 时间: {evt['time']}")
             if evt.get("location"):
                 lines.append(f"- 地点: {evt['location']}")
-            if evt.get("source_email"):
-                lines.append(f"- 来源: {evt['source_email']}")
             lines.append("")
+
+    if upcoming_notif:
+        lines.append("## 通知日程（邮件收到时间）")
+        lines.append("")
+        for i, evt in enumerate(upcoming_notif, 1):
+            date_display = evt["date"]
+            if date_display == today:
+                date_display += "（今天）"
+            elif date_display == tomorrow:
+                date_display += "（明天）"
+            lines.append(f"- {date_display} {evt.get('time','')} {evt['title']}")
+        lines.append("")
 
     if past:
         lines.append("## 已过期（留档参考）")
@@ -213,6 +227,11 @@ def create_calendar_events(events: list, work_dir: str) -> tuple:
 
         # 构建描述（纯 ASCII，避免特殊字符和 / 导致参数解析错误）
         desc_parts = []
+        evt_type = evt.get("event_type", "appointment")
+        if evt_type == "notification":
+            desc_parts.append("Type: Email Notification")
+        else:
+            desc_parts.append("Type: Appointment")
         if evt.get("location"):
             loc = evt['location']
             if loc.isascii() and '@' not in loc:

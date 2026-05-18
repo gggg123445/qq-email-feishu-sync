@@ -320,26 +320,50 @@ def _extract_schedule(text: str, email_info: Dict = None) -> List[Dict]:
     elif is_meeting:
         priority = "medium"
 
-    # 生成事件
+    # ── 生成事件 ──
+    # 从邮件主题提取标题
+    title = email_info.get("subject", "") if email_info else ""
+    if not title or title == "(无主题)":
+        first_line = text.split('\n')[0][:50]
+        title = first_line
+
+    source_email = email_info.get("from", "") if email_info else ""
+    email_date_str = email_info.get("date", "") if email_info else ""
+
+    # 解析邮件收到时间
+    received_dt = None
+    if email_date_str:
+        try:
+            received_dt = datetime.fromisoformat(email_date_str)
+        except (ValueError, TypeError):
+            pass
+
+    # ── 事件1: 通知日程（邮件收到时间）──
+    if received_dt:
+        events.append({
+            "title": f"收到: {title[:60]}",
+            "date": received_dt.strftime("%Y-%m-%d"),
+            "time": received_dt.strftime("%H:%M"),
+            "location": "",
+            "source_email": source_email,
+            "priority": priority,
+            "is_meeting": is_meeting,
+            "event_type": "notification",
+        })
+
+    # ── 事件2: 预约日程（邮件中的截止/面试/笔试时间）──
     if found_dates or is_meeting:
-        for date_str in (found_dates or [ref_date.strftime("%Y-%m-%d")]):
+        for date_str in (found_dates or []):
             time_str = found_times[0] if found_times else ""
-
-            # 从主题或正文提取标题
-            title = email_info.get("subject", "") if email_info else ""
-            if not title or title == "(无主题)":
-                # 从正文前 50 字提取
-                first_line = text.split('\n')[0][:50]
-                title = first_line
-
             events.append({
-                "title": title,
+                "title": title[:80],
                 "date": date_str,
                 "time": time_str,
                 "location": location,
-                "source_email": email_info.get("from", "") if email_info else "",
+                "source_email": source_email,
                 "priority": priority,
                 "is_meeting": is_meeting,
+                "event_type": "appointment",
             })
 
     return events
