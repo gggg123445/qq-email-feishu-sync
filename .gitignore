@@ -1,0 +1,5 @@
+.env
+__pycache__/
+*.pyc
+.DS_Store
+qq_schedule_7days.md
