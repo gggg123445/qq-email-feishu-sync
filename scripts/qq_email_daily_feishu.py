@@ -59,10 +59,13 @@ def _event_key(evt: dict) -> str:
 
 
 def extract_schedules(days: int = SCAN_DAYS):
-    """提取近 N 天邮件中的日程"""
-    from scripts.qq_email import search_emails, _extract_schedule
+    """从所有邮箱账户提取近 N 天邮件中的日程"""
+    from scripts.qq_email import search_all_accounts, _extract_schedule
 
-    emails = search_emails(days=days)
+    emails, account_labels = search_all_accounts(days=days)
+
+    for label in account_labels:
+        print(f"  {label}")
 
     all_events = []
     for em in emails:

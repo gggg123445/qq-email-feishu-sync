@@ -1,501 +1,606 @@
-     1|#!/usr/bin/env python3
-     2|"""QQ 邮箱日程提取工具
-     3|
-     4|连接 QQ 邮箱 IMAP，读取邮件，提取中文日程/会议信息。
-     5|
-     6|用法:
-     7|    python qq_email.py read [--count N]
-     8|    python qq_email.py unread
-     9|    python qq_email.py schedule [--days N]
-    10|    python qq_email.py search --from ADDR
-    11|    python qq_email.py search --subject KEYWORD
-    12|"""
-    13|
-    14|import os
-    15|import sys
-    16|import re
-    17|import json
-    18|import imaplib
-    19|import email
-    20|import email.message
-    21|import email.header
-    22|import email.utils
-    23|from email.header import decode_header
-    24|from datetime import datetime, timedelta
-    25|from typing import List, Dict, Optional, Tuple
-    26|import argparse
-    27|
-    28|# ── 配置 ─────────────────────────────────────────────────────────────
-    29|IMAP_HOST = "imap.qq.com"
-    30|IMAP_PORT = 993
-    31|SMTP_HOST = "smtp.qq.com"
-    32|SMTP_PORT = 465
-    33|
-    34|
-    35|def _get_credentials() -> Tuple[str, str]:
-    36|    """从环境变量获取 QQ 邮箱凭据"""
-    37|    from dotenv import load_dotenv
-    38|    load_dotenv(os.path.expanduser("~/.hermes/.env"))
-    39|
-    40|    email_addr = os.getenv("QQ_EMAIL")
-    41|    auth_code = os.getenv("QQ_AUTH_CODE")
-    42|
-    43|    if not email_addr or not auth_code:
-    44|        print("[ERROR] 请在 ~/.hermes/.env 中设置 QQ_EMAIL 和 QQ_AUTH_CODE")
-    45|        print("  QQ_EMAIL=your_qq@qq.com")
-    46|        print("  QQ_AUTH_CODE=你的授权码（不是QQ密码）")
-    47|        sys.exit(1)
-    48|
-    49|    return email_addr, auth_code
-    50|
-    51|
-    52|def _connect() -> imaplib.IMAP4_SSL:
-    53|    """建立 IMAP SSL 连接并登录"""
-    54|    email_addr, auth_code = _get_credentials()
-    55|
-    56|    try:
-    57|        imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
-    58|        imap.login(email_addr, auth_code)
-    59|        return imap
-    60|    except imaplib.IMAP4.error as e:
-    61|        print(f"[ERROR] 登录失败: {e}")
-    62|        print("  请检查：1) 授权码是否正确  2) IMAP 服务是否已开启")
-    63|        sys.exit(1)
-    64|
-    65|
-    66|def _decode_header_value(value: str) -> str:
-    67|    """解码邮件头字段（支持中文编码）"""
-    68|    if not value:
-    69|        return ""
-    70|    decoded_parts = decode_header(value)
-    71|    result = []
-    72|    for part, charset in decoded_parts:
-    73|        if isinstance(part, bytes):
-    74|            charset = charset or "utf-8"
-    75|            try:
-    76|                result.append(part.decode(charset, errors="replace"))
-    77|            except (LookupError, UnicodeDecodeError):
-    78|                result.append(part.decode("utf-8", errors="replace"))
-    79|        else:
-    80|            result.append(str(part))
-    81|    return "".join(result)
-    82|
-    83|
-    84|def _decode_email_body(msg: email.message.Message) -> str:
-    85|    """解码邮件正文（支持 HTML 和纯文本，自动处理编码）"""
-    86|    body = ""
-    87|
-    88|    if msg.is_multipart():
-    89|        for part in msg.walk():
-    90|            content_type = part.get_content_type()
-    91|            if content_type == "text/plain":
-    92|                payload = part.get_payload(decode=True)
-    93|                if payload:
-    94|                    charset = part.get_content_charset() or "utf-8"
-    95|                    try:
-    96|                        body = payload.decode(charset, errors="replace")
-    97|                    except (LookupError, UnicodeDecodeError):
-    98|                        body = payload.decode("utf-8", errors="replace")
-    99|                    break
-   100|            elif content_type == "text/html" and not body:
-   101|                payload = part.get_payload(decode=True)
-   102|                if payload:
-   103|                    charset = part.get_content_charset() or "utf-8"
-   104|                    try:
-   105|                        html = payload.decode(charset, errors="replace")
-   106|                    except (LookupError, UnicodeDecodeError):
-   107|                        html = payload.decode("utf-8", errors="replace")
-   108|                    # 简单去 HTML 标签
-   109|                    body = re.sub(r'<[^>]+>', ' ', html)
-   110|                    body = re.sub(r'\s+', ' ', body).strip()
-   111|    else:
-   112|        payload = msg.get_payload(decode=True)
-   113|        if payload:
-   114|            charset = msg.get_content_charset() or "utf-8"
-   115|            try:
-   116|                body = payload.decode(charset, errors="replace")
-   117|            except (LookupError, UnicodeDecodeError):
-   118|                body = payload.decode("utf-8", errors="replace")
-   119|
-   120|    return body
-   121|
-   122|
-   123|def _parse_email(msg_data) -> Dict:
-   124|    """解析单封邮件为结构化字典"""
-   125|    msg = email.message_from_bytes(msg_data)
-   126|
-   127|    subject = _decode_header_value(msg.get("Subject", ""))
-   128|    sender = _decode_header_value(msg.get("From", ""))
-   129|    date_str = msg.get("Date", "")
-   130|    to = _decode_header_value(msg.get("To", ""))
-   131|
-   132|    body = _decode_email_body(msg)
-   133|
-   134|    # 解析日期
-   135|    try:
-   136|        date_parsed = email.utils.parsedate_to_datetime(date_str)
-   137|    except (ValueError, TypeError):
-   138|        date_parsed = None
-   139|
-   140|    return {
-   141|        "subject": subject,
-   142|        "from": sender,
-   143|        "to": to,
-   144|        "date": date_parsed.isoformat() if date_parsed else date_str,
-   145|        "body": body[:5000],  # 限制长度
-   146|    }
-   147|
-   148|
-   149|# ── 日程提取 ─────────────────────────────────────────────────────────
-   150|# 中文数字映射
-   151|_CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
-   152|           "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
-   153|           "十一": 11, "十二": 12}
-   154|
-   155|_WEEKDAY_MAP = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
-   156|
-   157|
-   158|def _parse_relative_date(text: str, ref_date: datetime = None) -> Optional[str]:
-   159|    """解析相对日期（明天、下周二、本周五等）"""
-   160|    if ref_date is None:
-   161|        ref_date = datetime.now()
-   162|
-   163|    # 明天/后天/大后天
-   164|    if "今天" in text:
-   165|        return ref_date.strftime("%Y-%m-%d")
-   166|    if "明天" in text:
-   167|        return (ref_date + timedelta(days=1)).strftime("%Y-%m-%d")
-   168|    if "后天" in text:
-   169|        return (ref_date + timedelta(days=2)).strftime("%Y-%m-%d")
-   170|    if "大后天" in text:
-   171|        return (ref_date + timedelta(days=3)).strftime("%Y-%m-%d")
-   172|
-   173|    # 下周X / 本周X
-   174|    m = re.search(r'(下|本)周([\u4e00-\u9fff])', text)
-   175|    if m:
-   176|        prefix, day_char = m.group(1), m.group(2)
-   177|        target_wd = _WEEKDAY_MAP.get(day_char)
-   178|        if target_wd is not None:
-   179|            today_wd = ref_date.weekday()
-   180|            if prefix == "本":
-   181|                delta = (target_wd - today_wd) % 7
-   182|            else:  # 下
-   183|                delta = (target_wd - today_wd) % 7 + 7
-   184|            return (ref_date + timedelta(days=delta)).strftime("%Y-%m-%d")
-   185|
-   186|    return None
-   187|
-   188|
-   189|def _extract_schedule(text: str, email_info: Dict = None) -> List[Dict]:
-   190|    """从邮件正文提取日程信息"""
-   191|    events = []
-   192|    ref_date = datetime.now()
-   193|
-   194|    # ── 日期模式 ──
-   195|    date_patterns = [
-   196|        # 2026年5月20日 / 2026年05月20日
-   197|        (r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]',
-   198|         lambda m: f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"),
-   199|        # 2026-05-20 / 2026/05/20
-   200|        (r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})',
-   201|         lambda m: f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"),
-   202|        # 5月20日/号（无年份，取当前年）
-   203|        (r'(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]',
-   204|         lambda m: f"{ref_date.year}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"),
-   205|    ]
-   206|
-   207|    # ── 时间模式 ──
-   208|    time_patterns = [
-   209|        # 上午/下午 9:00 / 9点30分
-   210|        (r'(上午|下午|晚上|中午)\s*(\d{1,2})\s*[：:点时]\s*(\d{1,2})?\s*[分]?',
-   211|         lambda m: _parse_cn_time(m.group(1), m.group(2), m.group(3))),
-   212|        # 14:00 / 14：00
-   213|        (r'(?<!\d)(\d{1,2})\s*[：:]\s*(\d{2})(?!\d)',
-   214|         lambda m: f"{int(m.group(1)):02d}:{m.group(2)}"),
-   215|        # 9点
-   216|        (r'(?<!\d)(\d{1,2})\s*点(?!\d)',
-   217|         lambda m: f"{int(m.group(1)):02d}:00"),
-   218|    ]
-   219|
-   220|    # ── 会议关键词 ──
-   221|    meeting_keywords = [
-   222|        "会议", "面试", "笔试", "面谈", "洽谈", "研讨", "汇报",
-   223|        "培训", "讲座", "答辩", "评审", "讨论会", "电话会",
-   224|        "腾讯会议", "飞书会议", "Zoom", "zoom", "Teams", "teams",
-   225|        "线上", "线下", "视频会议", "语音会议",
-   226|    ]
-   227|
-   228|    location_patterns = [
-   229|        r'(?:地点|地址|会[议室]|在哪里|会议室)[：:\s]*([^\n,，。]{2,30})',
-   230|        r'(?:腾讯会议|Zoom|飞书会议|Teams)[：:\s]*(https?://\S+)',
-   231|        r'(?:会议号|会议ID|Meeting ID)[：:\s]*(\d[\d\s]{5,})',
-   232|    ]
-   233|
-   234|    # 提取所有日期
-   235|    found_dates = []
-   236|    for pattern, formatter in date_patterns:
-   237|        for m in re.finditer(pattern, text):
-   238|            try:
-   239|                date_str = formatter(m)
-   240|                # 验证日期合法性
-   241|                datetime.strptime(date_str, "%Y-%m-%d")
-   242|                found_dates.append(date_str)
-   243|            except (ValueError, TypeError):
-   244|                continue
-   245|
-   246|    # 相对日期
-   247|    rel_date = _parse_relative_date(text, ref_date)
-   248|    if rel_date:
-   249|        found_dates.append(rel_date)
-   250|
-   251|    # 去重
-   252|    found_dates = list(dict.fromkeys(found_dates))
-   253|
-   254|    # 提取所有时间
-   255|    found_times = []
-   256|    for pattern, formatter in time_patterns:
-   257|        for m in re.finditer(pattern, text):
-   258|            try:
-   259|                time_str = formatter(m)
-   260|                if time_str and re.match(r'\d{2}:\d{2}', time_str):
-   261|                    found_times.append(time_str)
-   262|            except Exception:
-   263|                continue
-   264|    found_times = list(dict.fromkeys(found_times))
-   265|
-   266|    # 检测会议关键词
-   267|    is_meeting = any(kw in text for kw in meeting_keywords)
-   268|
-   269|    # 提取地点
-   270|    locations = []
-   271|    for pattern in location_patterns:
-   272|        for m in re.finditer(pattern, text):
-   273|            locations.append(m.group(1).strip())
-   274|    location = locations[0] if locations else ""
-   275|
-   276|    # 提取会议链接
-   277|    link_match = re.search(r'https?://\S*(?:meeting|zoom|teams|feishu|lark|vc)\S*', text, re.IGNORECASE)
-   278|    if link_match and not location:
-   279|        location = link_match.group(0)
-   280|
-   281|    # 优先级判断
-   282|    priority = "normal"
-   283|    high_keywords = ["紧急", "ASAP", "立即", "马上", "面试", "笔试", "答辩"]
-   284|    if any(kw in text for kw in high_keywords):
-   285|        priority = "high"
-   286|    elif is_meeting:
-   287|        priority = "medium"
-   288|
-   289|    # 生成事件
-   290|    if found_dates or is_meeting:
-   291|        for date_str in (found_dates or [ref_date.strftime("%Y-%m-%d")]):
-   292|            time_str = found_times[0] if found_times else ""
-   293|
-   294|            # 从主题或正文提取标题
-   295|            title = email_info.get("subject", "") if email_info else ""
-   296|            if not title or title == "(无主题)":
-   297|                # 从正文前 50 字提取
-   298|                first_line = text.split('\n')[0][:50]
-   299|                title = first_line
-   300|
-   301|            events.append({
-   302|                "title": title,
-   303|                "date": date_str,
-   304|                "time": time_str,
-   305|                "location": location,
-   306|                "source_email": email_info.get("from", "") if email_info else "",
-   307|                "priority": priority,
-   308|                "is_meeting": is_meeting,
-   309|            })
-   310|
-   311|    return events
-   312|
-   313|
-   314|def _parse_cn_time(period: str, hour: str, minute: str) -> str:
-   315|    """解析中文时间表述"""
-   316|    h = int(hour)
-   317|    m = int(minute) if minute else 0
-   318|
-   319|    if period in ("下午", "晚上") and h < 12:
-   320|        h += 12
-   321|    elif period == "中午" and h == 12:
-   322|        h = 12
-   323|
-   324|    return f"{h:02d}:{m:02d}"
-   325|
-   326|
-   327|# ── 邮件读取 ─────────────────────────────────────────────────────────
-   328|def read_emails(count: int = 10, unread_only: bool = False) -> List[Dict]:
-   329|    """读取最近 N 封邮件"""
-   330|    imap = _connect()
-   331|
-   332|    try:
-   333|        imap.select("INBOX")
-   334|
-   335|        if unread_only:
-   336|            status, msg_ids = imap.search(None, "UNSEEN")
-   337|        else:
-   338|            status, msg_ids = imap.search(None, "ALL")
-   339|
-   340|        if status != "OK":
-   341|            print("[ERROR] 搜索邮件失败")
-   342|            return []
-   343|
-   344|        id_list = msg_ids[0].split()
-   345|        if not id_list:
-   346|            print("[INFO] 没有邮件")
-   347|            return []
-   348|
-   349|        # 取最新的 N 封
-   350|        recent_ids = id_list[-count:]
-   351|        recent_ids.reverse()  # 最新在前
-   352|
-   353|        emails = []
-   354|        for msg_id in recent_ids:
-   355|            status, data = imap.fetch(msg_id, "(RFC822)")
-   356|            if status == "OK":
-   357|                parsed = _parse_email(data[0][1])
-   358|                parsed["msg_id"] = msg_id.decode()
-   359|                emails.append(parsed)
-   360|
-   361|        return emails
-   362|
-   363|    finally:
-   364|        imap.logout()
-   365|
-   366|
-   367|def search_emails(from_addr: str = None, subject: str = None,
-   368|                  days: int = None, count: int = 50) -> List[Dict]:
-   369|    """搜索邮件"""
-   370|    imap = _connect()
-   371|
-   372|    try:
-   373|        imap.select("INBOX")
-   374|
-   375|        # 构建 IMAP 搜索条件
-   376|        criteria = []
-   377|        if from_addr:
-   378|            criteria.append(f'FROM "{from_addr}"')
-   379|        if subject:
-   380|            criteria.append(f'SUBJECT "{subject}"')
-   381|        if days:
-   382|            since_date = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
-   383|            criteria.append(f'SINCE {since_date}')
-   384|
-   385|        search_str = " ".join(criteria) if criteria else "ALL"
-   386|        status, msg_ids = imap.search(None, search_str)
-   387|
-   388|        if status != "OK":
-   389|            print("[ERROR] 搜索失败")
-   390|            return []
-   391|
-   392|        id_list = msg_ids[0].split()
-   393|        if not id_list:
-   394|            print("[INFO] 未找到匹配的邮件")
-   395|            return []
-   396|
-   397|        recent_ids = id_list[-count:]
-   398|        recent_ids.reverse()
-   399|
-   400|        emails = []
-   401|        for msg_id in recent_ids:
-   402|            status, data = imap.fetch(msg_id, "(RFC822)")
-   403|            if status == "OK":
-   404|                parsed = _parse_email(data[0][1])
-   405|                emails.append(parsed)
-   406|
-   407|        return emails
-   408|
-   409|    finally:
-   410|        imap.logout()
-   411|
-   412|
-   413|def extract_schedules(days: int = 7) -> Dict:
-   414|    """从最近 N 天邮件中提取日程"""
-   415|    emails = search_emails(days=days)
-   416|
-   417|    all_events = []
-   418|    for em in emails:
-   419|        events = _extract_schedule(em["body"], em)
-   420|        if events:
-   421|            all_events.extend(events)
-   422|
-   423|    # 按日期排序
-   424|    all_events.sort(key=lambda e: (e["date"], e.get("time", "")))
-   425|
-   426|    return {
-   427|        "total_emails_scanned": len(emails),
-   428|        "events_found": len(all_events),
-   429|        "events": all_events,
-   430|    }
-   431|
-   432|
-   433|# ── 格式化输出 ───────────────────────────────────────────────────────
-   434|def format_email(em: Dict, index: int = 0) -> str:
-   435|    """格式化单封邮件为可读文本"""
-   436|    lines = []
-   437|    if index:
-   438|        lines.append(f"--- 邮件 {index} ---")
-   439|    lines.append(f"主题: {em['subject']}")
-   440|    lines.append(f"发件人: {em['from']}")
-   441|    lines.append(f"日期: {em['date']}")
-   442|    # 正文前 300 字
-   443|    body_preview = em['body'][:300].replace('\n', ' ').strip()
-   444|    if len(em['body']) > 300:
-   445|        body_preview += "..."
-   446|    lines.append(f"正文: {body_preview}")
-   447|    return "\n".join(lines)
-   448|
-   449|
-   450|def format_schedule(result: Dict) -> str:
-   451|    """格式化日程提取结果"""
-   452|    lines = []
-   453|    lines.append(f"扫描邮件: {result['total_emails_scanned']} 封")
-   454|    lines.append(f"发现日程: {result['events_found']} 个")
-   455|    lines.append("")
-   456|
-   457|    if not result["events"]:
-   458|        lines.append("未发现日程信息。")
-   459|        return "\n".join(lines)
-   460|
-   461|    for i, evt in enumerate(result["events"], 1):
-   462|        priority_icon = {"high": "🔴", "medium": "🟡", "normal": "⚪"}.get(evt["priority"], "⚪")
-   463|        lines.append(f"{priority_icon} [{i}] {evt['title']}")
-   464|        lines.append(f"   日期: {evt['date']}  {evt['time'] or '时间待定'}")
-   465|        if evt["location"]:
-   466|            lines.append(f"   地点: {evt['location']}")
-   467|        if evt["source_email"]:
-   468|            lines.append(f"   来源: {evt['source_email']}")
-   469|        lines.append("")
-   470|
-   471|    return "\n".join(lines)
-   472|
-   473|
-   474|# ── CLI ──────────────────────────────────────────────────────────────
-   475|def main():
-   476|    parser = argparse.ArgumentParser(description="QQ 邮箱日程提取工具")
-   477|    sub = parser.add_subparsers(dest="command")
-   478|
-   479|    # read
-   480|    read_p = sub.add_parser("read", help="读取最近邮件")
-   481|    read_p.add_argument("--count", type=int, default=10, help="邮件数量")
-   482|
-   483|    # unread
-   484|    unread_p = sub.add_parser("unread", help="读取未读邮件")
-   485|    unread_p.add_argument("--count", type=int, default=20, help="最大数量")
-   486|
-   487|    # schedule
-   488|    sched_p = sub.add_parser("schedule", help="提取日程信息")
-   489|    sched_p.add_argument("--days", type=int, default=7, help="扫描最近N天")
-   490|
-   491|    # search
-   492|    search_p = sub.add_parser("search", help="搜索邮件")
-   493|    search_p.add_argument("--from", dest="from_addr", help="发件人地址")
-   494|    search_p.add_argument("--subject", help="主题关键词")
-   495|    search_p.add_argument("--days", type=int, default=30, help="搜索最近N天")
-   496|    search_p.add_argument("--count", type=int, default=20, help="最大结果数")
-   497|
-   498|    args = parser.parse_args()
-   499|
-   500|    if args.command == "read":
-   501|
+#!/usr/bin/env python3
+"""QQ 邮箱日程提取工具
+
+连接 QQ 邮箱 IMAP，读取邮件，提取中文日程/会议信息。
+
+用法:
+    python qq_email.py read [--count N]
+    python qq_email.py unread
+    python qq_email.py schedule [--days N]
+    python qq_email.py search --from ADDR
+    python qq_email.py search --subject KEYWORD
+"""
+
+import os
+import sys
+import re
+import json
+import imaplib
+import email
+import email.message
+import email.header
+import email.utils
+from email.header import decode_header
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Tuple
+import argparse
+
+# ── 配置 ─────────────────────────────────────────────────────────────
+ACCOUNTS = {
+    "qq": {
+        "env_email": "QQ_EMAIL",
+        "env_auth": "QQ_AUTH_CODE",
+        "imap_host": "imap.qq.com",
+        "imap_port": 993,
+        "label": "QQ邮箱",
+    },
+    "nudt": {
+        "env_email": "NUDT_EMAIL",
+        "env_auth": "NUDT_AUTH_CODE",
+        "imap_host": "mail.nudt.edu.cn",
+        "imap_port": 993,
+        "label": "国防科大邮箱",
+    },
+}
+
+
+def _get_all_accounts() -> List[Dict]:
+    """从环境变量获取所有已配置的邮箱账户"""
+    from dotenv import load_dotenv
+    load_dotenv(os.path.expanduser("~/.hermes/.env"))
+
+    accounts = []
+    for key, cfg in ACCOUNTS.items():
+        email_addr = os.getenv(cfg["env_email"])
+        auth_code = os.getenv(cfg["env_auth"])
+        if email_addr and auth_code:
+            accounts.append({
+                "key": key,
+                "email": email_addr,
+                "auth_code": auth_code,
+                "imap_host": cfg["imap_host"],
+                "imap_port": cfg["imap_port"],
+                "label": cfg["label"],
+            })
+    return accounts
+
+
+def _get_credentials(account: str = None) -> Tuple[str, str, str, int]:
+    """获取指定账户的凭据，默认返回第一个可用账户"""
+    accounts = _get_all_accounts()
+    if not accounts:
+        print("[ERROR] 未配置任何邮箱账户，请在 ~/.hermes/.env 中设置")
+        sys.exit(1)
+
+    if account:
+        for acc in accounts:
+            if acc["key"] == account:
+                return acc["email"], acc["auth_code"], acc["imap_host"], acc["imap_port"]
+        print(f"[ERROR] 未找到账户 '{account}'")
+        sys.exit(1)
+
+    acc = accounts[0]
+    return acc["email"], acc["auth_code"], acc["imap_host"], acc["imap_port"]
+
+
+def _connect(account: str = None) -> imaplib.IMAP4_SSL:
+    """建立 IMAP SSL 连接并登录"""
+    email_addr, auth_code, imap_host, imap_port = _get_credentials(account)
+
+    try:
+        imap = imaplib.IMAP4_SSL(imap_host, imap_port)
+        imap.login(email_addr, auth_code)
+        return imap
+    except imaplib.IMAP4.error as e:
+        print(f"[ERROR] 登录失败 ({email_addr}): {e}")
+        print("  请检查：1) 密码/授权码是否正确  2) IMAP 服务是否已开启")
+        sys.exit(1)
+
+
+def _decode_header_value(value: str) -> str:
+    """解码邮件头字段（支持中文编码）"""
+    if not value:
+        return ""
+    decoded_parts = decode_header(value)
+    result = []
+    for part, charset in decoded_parts:
+        if isinstance(part, bytes):
+            charset = charset or "utf-8"
+            try:
+                result.append(part.decode(charset, errors="replace"))
+            except (LookupError, UnicodeDecodeError):
+                result.append(part.decode("utf-8", errors="replace"))
+        else:
+            result.append(str(part))
+    return "".join(result)
+
+
+def _decode_email_body(msg: email.message.Message) -> str:
+    """解码邮件正文（支持 HTML 和纯文本，自动处理编码）"""
+    body = ""
+
+    if msg.is_multipart():
+        for part in msg.walk():
+            content_type = part.get_content_type()
+            if content_type == "text/plain":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    try:
+                        body = payload.decode(charset, errors="replace")
+                    except (LookupError, UnicodeDecodeError):
+                        body = payload.decode("utf-8", errors="replace")
+                    break
+            elif content_type == "text/html" and not body:
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    try:
+                        html = payload.decode(charset, errors="replace")
+                    except (LookupError, UnicodeDecodeError):
+                        html = payload.decode("utf-8", errors="replace")
+                    # 简单去 HTML 标签
+                    body = re.sub(r'<[^>]+>', ' ', html)
+                    body = re.sub(r'\s+', ' ', body).strip()
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            charset = msg.get_content_charset() or "utf-8"
+            try:
+                body = payload.decode(charset, errors="replace")
+            except (LookupError, UnicodeDecodeError):
+                body = payload.decode("utf-8", errors="replace")
+
+    return body
+
+
+def _parse_email(msg_data) -> Dict:
+    """解析单封邮件为结构化字典"""
+    msg = email.message_from_bytes(msg_data)
+
+    subject = _decode_header_value(msg.get("Subject", ""))
+    sender = _decode_header_value(msg.get("From", ""))
+    date_str = msg.get("Date", "")
+    to = _decode_header_value(msg.get("To", ""))
+
+    body = _decode_email_body(msg)
+
+    # 解析日期
+    try:
+        date_parsed = email.utils.parsedate_to_datetime(date_str)
+    except (ValueError, TypeError):
+        date_parsed = None
+
+    return {
+        "subject": subject,
+        "from": sender,
+        "to": to,
+        "date": date_parsed.isoformat() if date_parsed else date_str,
+        "body": body[:5000],  # 限制长度
+    }
+
+
+# ── 日程提取 ─────────────────────────────────────────────────────────
+# 中文数字映射
+_CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+           "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+           "十一": 11, "十二": 12}
+
+_WEEKDAY_MAP = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+
+
+def _parse_relative_date(text: str, ref_date: datetime = None) -> Optional[str]:
+    """解析相对日期（明天、下周二、本周五等）"""
+    if ref_date is None:
+        ref_date = datetime.now()
+
+    # 明天/后天/大后天
+    if "今天" in text:
+        return ref_date.strftime("%Y-%m-%d")
+    if "明天" in text:
+        return (ref_date + timedelta(days=1)).strftime("%Y-%m-%d")
+    if "后天" in text:
+        return (ref_date + timedelta(days=2)).strftime("%Y-%m-%d")
+    if "大后天" in text:
+        return (ref_date + timedelta(days=3)).strftime("%Y-%m-%d")
+
+    # 下周X / 本周X
+    m = re.search(r'(下|本)周([\u4e00-\u9fff])', text)
+    if m:
+        prefix, day_char = m.group(1), m.group(2)
+        target_wd = _WEEKDAY_MAP.get(day_char)
+        if target_wd is not None:
+            today_wd = ref_date.weekday()
+            if prefix == "本":
+                delta = (target_wd - today_wd) % 7
+            else:  # 下
+                delta = (target_wd - today_wd) % 7 + 7
+            return (ref_date + timedelta(days=delta)).strftime("%Y-%m-%d")
+
+    return None
+
+
+def _extract_schedule(text: str, email_info: Dict = None) -> List[Dict]:
+    """从邮件正文提取日程信息"""
+    events = []
+    ref_date = datetime.now()
+
+    # ── 日期模式 ──
+    date_patterns = [
+        # 2026年5月20日 / 2026年05月20日
+        (r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]',
+         lambda m: f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"),
+        # 2026-05-20 / 2026/05/20
+        (r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})',
+         lambda m: f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"),
+        # 5月20日/号（无年份，取当前年）
+        (r'(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]',
+         lambda m: f"{ref_date.year}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"),
+    ]
+
+    # ── 时间模式 ──
+    time_patterns = [
+        # 上午/下午 9:00 / 9点30分
+        (r'(上午|下午|晚上|中午)\s*(\d{1,2})\s*[：:点时]\s*(\d{1,2})?\s*[分]?',
+         lambda m: _parse_cn_time(m.group(1), m.group(2), m.group(3))),
+        # 14:00 / 14：00
+        (r'(?<!\d)(\d{1,2})\s*[：:]\s*(\d{2})(?!\d)',
+         lambda m: f"{int(m.group(1)):02d}:{m.group(2)}"),
+        # 9点
+        (r'(?<!\d)(\d{1,2})\s*点(?!\d)',
+         lambda m: f"{int(m.group(1)):02d}:00"),
+    ]
+
+    # ── 会议关键词 ──
+    meeting_keywords = [
+        "会议", "面试", "笔试", "面谈", "洽谈", "研讨", "汇报",
+        "培训", "讲座", "答辩", "评审", "讨论会", "电话会",
+        "腾讯会议", "飞书会议", "Zoom", "zoom", "Teams", "teams",
+        "线上", "线下", "视频会议", "语音会议",
+    ]
+
+    location_patterns = [
+        r'(?:地点|地址|会[议室]|在哪里|会议室)[：:\s]*([^\n,，。]{2,30})',
+        r'(?:腾讯会议|Zoom|飞书会议|Teams)[：:\s]*(https?://\S+)',
+        r'(?:会议号|会议ID|Meeting ID)[：:\s]*(\d[\d\s]{5,})',
+    ]
+
+    # 提取所有日期
+    found_dates = []
+    for pattern, formatter in date_patterns:
+        for m in re.finditer(pattern, text):
+            try:
+                date_str = formatter(m)
+                # 验证日期合法性
+                datetime.strptime(date_str, "%Y-%m-%d")
+                found_dates.append(date_str)
+            except (ValueError, TypeError):
+                continue
+
+    # 相对日期
+    rel_date = _parse_relative_date(text, ref_date)
+    if rel_date:
+        found_dates.append(rel_date)
+
+    # 去重
+    found_dates = list(dict.fromkeys(found_dates))
+
+    # 提取所有时间
+    found_times = []
+    for pattern, formatter in time_patterns:
+        for m in re.finditer(pattern, text):
+            try:
+                time_str = formatter(m)
+                if time_str and re.match(r'\d{2}:\d{2}', time_str):
+                    found_times.append(time_str)
+            except Exception:
+                continue
+    found_times = list(dict.fromkeys(found_times))
+
+    # 检测会议关键词
+    is_meeting = any(kw in text for kw in meeting_keywords)
+
+    # 提取地点
+    locations = []
+    for pattern in location_patterns:
+        for m in re.finditer(pattern, text):
+            locations.append(m.group(1).strip())
+    location = locations[0] if locations else ""
+
+    # 提取会议链接
+    link_match = re.search(r'https?://\S*(?:meeting|zoom|teams|feishu|lark|vc)\S*', text, re.IGNORECASE)
+    if link_match and not location:
+        location = link_match.group(0)
+
+    # 优先级判断
+    priority = "normal"
+    high_keywords = ["紧急", "ASAP", "立即", "马上", "面试", "笔试", "答辩"]
+    if any(kw in text for kw in high_keywords):
+        priority = "high"
+    elif is_meeting:
+        priority = "medium"
+
+    # 生成事件
+    if found_dates or is_meeting:
+        for date_str in (found_dates or [ref_date.strftime("%Y-%m-%d")]):
+            time_str = found_times[0] if found_times else ""
+
+            # 从主题或正文提取标题
+            title = email_info.get("subject", "") if email_info else ""
+            if not title or title == "(无主题)":
+                # 从正文前 50 字提取
+                first_line = text.split('\n')[0][:50]
+                title = first_line
+
+            events.append({
+                "title": title,
+                "date": date_str,
+                "time": time_str,
+                "location": location,
+                "source_email": email_info.get("from", "") if email_info else "",
+                "priority": priority,
+                "is_meeting": is_meeting,
+            })
+
+    return events
+
+
+def _parse_cn_time(period: str, hour: str, minute: str) -> str:
+    """解析中文时间表述"""
+    h = int(hour)
+    m = int(minute) if minute else 0
+
+    if period in ("下午", "晚上") and h < 12:
+        h += 12
+    elif period == "中午" and h == 12:
+        h = 12
+
+    return f"{h:02d}:{m:02d}"
+
+
+# ── 邮件读取 ─────────────────────────────────────────────────────────
+def read_emails(count: int = 10, unread_only: bool = False,
+                account: str = None) -> List[Dict]:
+    """读取最近 N 封邮件"""
+    imap = _connect(account)
+
+    try:
+        imap.select("INBOX")
+
+        if unread_only:
+            status, msg_ids = imap.search(None, "UNSEEN")
+        else:
+            status, msg_ids = imap.search(None, "ALL")
+
+        if status != "OK":
+            print("[ERROR] 搜索邮件失败")
+            return []
+
+        id_list = msg_ids[0].split()
+        if not id_list:
+            print("[INFO] 没有邮件")
+            return []
+
+        # 取最新的 N 封
+        recent_ids = id_list[-count:]
+        recent_ids.reverse()  # 最新在前
+
+        emails = []
+        for msg_id in recent_ids:
+            status, data = imap.fetch(msg_id, "(RFC822)")
+            if status == "OK":
+                parsed = _parse_email(data[0][1])
+                parsed["msg_id"] = msg_id.decode()
+                emails.append(parsed)
+
+        return emails
+
+    finally:
+        imap.logout()
+
+
+def search_emails(from_addr: str = None, subject: str = None,
+                  days: int = None, count: int = 50,
+                  account: str = None) -> List[Dict]:
+    """搜索邮件"""
+    imap = _connect(account)
+
+    try:
+        imap.select("INBOX")
+
+        # 构建 IMAP 搜索条件
+        criteria = []
+        if from_addr:
+            criteria.append(f'FROM "{from_addr}"')
+        if subject:
+            criteria.append(f'SUBJECT "{subject}"')
+        if days:
+            since_date = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
+            criteria.append(f'SINCE {since_date}')
+
+        search_str = " ".join(criteria) if criteria else "ALL"
+        status, msg_ids = imap.search(None, search_str)
+
+        if status != "OK":
+            print("[ERROR] 搜索失败")
+            return []
+
+        id_list = msg_ids[0].split()
+        if not id_list:
+            print("[INFO] 未找到匹配的邮件")
+            return []
+
+        recent_ids = id_list[-count:]
+        recent_ids.reverse()
+
+        emails = []
+        for msg_id in recent_ids:
+            status, data = imap.fetch(msg_id, "(RFC822)")
+            if status == "OK":
+                parsed = _parse_email(data[0][1])
+                emails.append(parsed)
+
+        return emails
+
+    finally:
+        imap.logout()
+
+
+def extract_schedules(days: int = 7) -> Dict:
+    """从最近 N 天邮件中提取日程"""
+    emails = search_emails(days=days)
+
+    all_events = []
+    for em in emails:
+        events = _extract_schedule(em["body"], em)
+        if events:
+            all_events.extend(events)
+
+    # 按日期排序
+    all_events.sort(key=lambda e: (e["date"], e.get("time", "")))
+
+    return {
+        "total_emails_scanned": len(emails),
+        "events_found": len(all_events),
+        "events": all_events,
+    }
+
+
+# ── 格式化输出 ───────────────────────────────────────────────────────
+def format_email(em: Dict, index: int = 0) -> str:
+    """格式化单封邮件为可读文本"""
+    lines = []
+    if index:
+        lines.append(f"--- 邮件 {index} ---")
+    lines.append(f"主题: {em['subject']}")
+    lines.append(f"发件人: {em['from']}")
+    lines.append(f"日期: {em['date']}")
+    # 正文前 300 字
+    body_preview = em['body'][:300].replace('\n', ' ').strip()
+    if len(em['body']) > 300:
+        body_preview += "..."
+    lines.append(f"正文: {body_preview}")
+    return "\n".join(lines)
+
+
+def format_schedule(result: Dict) -> str:
+    """格式化日程提取结果"""
+    lines = []
+    lines.append(f"扫描邮件: {result['total_emails_scanned']} 封")
+    lines.append(f"发现日程: {result['events_found']} 个")
+    lines.append("")
+
+    if not result["events"]:
+        lines.append("未发现日程信息。")
+        return "\n".join(lines)
+
+    for i, evt in enumerate(result["events"], 1):
+        priority_icon = {"high": "🔴", "medium": "🟡", "normal": "⚪"}.get(evt["priority"], "⚪")
+        lines.append(f"{priority_icon} [{i}] {evt['title']}")
+        lines.append(f"   日期: {evt['date']}  {evt['time'] or '时间待定'}")
+        if evt["location"]:
+            lines.append(f"   地点: {evt['location']}")
+        if evt["source_email"]:
+            lines.append(f"   来源: {evt['source_email']}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def search_all_accounts(from_addr: str = None, subject: str = None,
+                        days: int = None, count: int = 50) -> Tuple[List[Dict], List[str]]:
+    """搜索所有已配置的邮箱账户，返回 (合并邮件列表, 账户标签列表)"""
+    all_accounts = _get_all_accounts()
+    all_emails = []
+    labels = []
+
+    for acc in all_accounts:
+        try:
+            emails = search_emails(
+                from_addr=from_addr, subject=subject,
+                days=days, count=count, account=acc["key"]
+            )
+            for em in emails:
+                em["account"] = acc["key"]
+                em["account_label"] = acc["label"]
+            all_emails.extend(emails)
+            labels.append(f"{acc['label']}({acc['email']}): {len(emails)}封")
+        except Exception as e:
+            labels.append(f"{acc['label']}({acc['email']}): 失败({e})")
+
+    return all_emails, labels
+
+
+# ── CLI ──────────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(description="QQ 邮箱日程提取工具")
+    sub = parser.add_subparsers(dest="command")
+
+    # read
+    read_p = sub.add_parser("read", help="读取最近邮件")
+    read_p.add_argument("--count", type=int, default=10, help="邮件数量")
+
+    # unread
+    unread_p = sub.add_parser("unread", help="读取未读邮件")
+    unread_p.add_argument("--count", type=int, default=20, help="最大数量")
+
+    # schedule
+    sched_p = sub.add_parser("schedule", help="提取日程信息")
+    sched_p.add_argument("--days", type=int, default=7, help="扫描最近N天")
+
+    # search
+    search_p = sub.add_parser("search", help="搜索邮件")
+    search_p.add_argument("--from", dest="from_addr", help="发件人地址")
+    search_p.add_argument("--subject", help="主题关键词")
+    search_p.add_argument("--days", type=int, default=30, help="搜索最近N天")
+    search_p.add_argument("--count", type=int, default=20, help="最大结果数")
+
+    args = parser.parse_args()
+
+    if args.command == "read":
+        emails = read_emails(count=args.count)
+        for i, em in enumerate(emails, 1):
+            print(format_email(em, i))
+            print()
+
+    elif args.command == "unread":
+        emails = read_emails(count=args.count, unread_only=True)
+        if not emails:
+            print("没有未读邮件。")
+        else:
+            print(f"未读邮件: {len(emails)} 封\n")
+            for i, em in enumerate(emails, 1):
+                print(format_email(em, i))
+                print()
+
+    elif args.command == "schedule":
+        result = extract_schedules(days=args.days)
+        print(format_schedule(result))
+        # 同时输出 JSON 供 Agent 使用
+        json_path = os.path.expanduser("~/.hermes/tmp/schedules.json")
+        os.makedirs(os.path.dirname(json_path), exist_ok=True)
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        print(f"\n[JSON 已保存到 {json_path}]")
+
+    elif args.command == "search":
+        emails = search_emails(
+            from_addr=args.from_addr,
+            subject=args.subject,
+            days=args.days,
+            count=args.count,
+        )
+        if not emails:
+            print("未找到匹配邮件。")
+        else:
+            print(f"找到 {len(emails)} 封邮件:\n")
+            for i, em in enumerate(emails, 1):
+                print(format_email(em, i))
+                print()
+
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
